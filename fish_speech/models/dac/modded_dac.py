@@ -104,16 +104,26 @@ class Transformer(nn.Module):
         )
         self.norm = RMSNorm(config.dim, eps=config.norm_eps)
 
+        # These are sized from config.block_size, the declared maximum sequence
+        # length for this transformer (2048 for the quantizer modules, 8192 for
+        # the encoder/decoder ones). They used to be hardcoded at 327680 and
+        # 32768 regardless of config, which made the causal mask alone
+        # 32768^2 bytes = 1.0 GiB of VRAM per instance - dead weight, since the
+        # codec runs at 21.53 Hz and never approaches that many positions.
+        max_positions = config.block_size
+
         # Only compute RoPE frequencies if using RoPE
         if config.pos_embed_type == "rope":
             freqs_cis = precompute_freqs_cis(
-                327680, self.config.head_dim, self.config.rope_base
+                max_positions, self.config.head_dim, self.config.rope_base
             )
             self.register_buffer("freqs_cis", freqs_cis, persistent=False)
         else:
             self.register_buffer("freqs_cis", None)
 
-        causal_mask = torch.tril(torch.ones(32768, 32768, dtype=torch.bool))
+        causal_mask = torch.tril(
+            torch.ones(max_positions, max_positions, dtype=torch.bool)
+        )
         self.register_buffer("causal_mask", causal_mask, persistent=False)
 
         self.max_batch_size = -1
@@ -922,9 +932,70 @@ class DAC(BaseModel, CodecMixin):
         indices_lens = torch.ceil(audio_lengths / self.frame_length).long()
         return indices, indices_lens
 
-    def from_indices(self, indices: torch.Tensor):
-        z = self.quantizer.decode(indices)
-        return self.decoder(z)
+    def from_indices(
+        self,
+        indices: torch.Tensor,
+        chunk_frames: int = 0,
+        overlap_frames: int = 32,
+    ):
+        """Decode VQ indices to audio.
+
+        chunk_frames > 0 bounds activation memory by running the convolutional
+        part of decoding (`quantizer.upsample` + `self.decoder`) over slices of
+        at most `chunk_frames` token frames instead of the whole sequence. That
+        part is where activations explode: a token frame becomes 2048 audio
+        samples, and the widest intermediate tensor is 768 channels at a
+        quarter of the sample rate.
+
+        The result reproduces a single pass. Every layer below post_module is a
+        causal convolution, so an output sample depends only on inputs at or
+        before it, and never more than 10 frames back - measured, not assumed;
+        see tools/verify_codec_decode.py. Feeding a chunk `overlap_frames`
+        frames of real left context and discarding the audio for those frames
+        therefore reproduces what a full pass would have produced: the zero
+        left-padding the chunk's first layers see has been pushed out of every
+        kept sample's receptive field. In float64 the residual difference is
+        1.6e-15, the rounding floor.
+
+        post_module is deliberately *not* chunked: its stacked window-128
+        attention layers reach back about a thousand frames, and windowing it
+        costs real quality (a previous attempt measured 12.2 dB SNR). It is
+        also cheap, so there is nothing to gain.
+        """
+        z_post = self.quantizer.decode_codes(indices)
+
+        if chunk_frames <= 0 or z_post.shape[-1] <= chunk_frames:
+            return self.decoder(self.quantizer.upsample(z_post))
+
+        return self._decode_chunked(z_post, chunk_frames, overlap_frames)
+
+    def _decode_chunked(
+        self, z_post: torch.Tensor, chunk_frames: int, overlap_frames: int
+    ):
+        if overlap_frames < 0:
+            raise ValueError(f"overlap_frames must be >= 0, got {overlap_frames}")
+
+        # Samples of audio produced per post_module frame: 4 from
+        # quantizer.upsample, 512 from the decoder's transposed convolutions.
+        ratio = int(np.prod(self.quantizer.downsample_factor)) * int(
+            np.prod(self.decoder_rates)
+        )
+        total_frames = z_post.shape[-1]
+
+        chunks = []
+        for start in range(0, total_frames, chunk_frames):
+            context = min(overlap_frames, start)
+            piece = z_post[..., start - context : start + chunk_frames]
+            audio = self.decoder(self.quantizer.upsample(piece))
+            # Drop the context's audio; it was only there to prime the convs.
+            chunks.append(audio[..., context * ratio :])
+
+        audio = torch.cat(chunks, dim=-1)
+        assert audio.shape[-1] == total_frames * ratio, (
+            f"chunked decode produced {audio.shape[-1]} samples, "
+            f"expected {total_frames * ratio}"
+        )
+        return audio
 
     def decode(self, z: torch.Tensor):
         """Decode given latent codes and return audio data
@@ -1005,7 +1076,7 @@ if __name__ == "__main__":
 
     # 配置路径
     config_path = "fish_speech/configs/modded_dac_vq.yaml"
-    checkpoint_path = "checkpoints/s2-pro/codec.pth"
+    checkpoint_path = "checkpoints/s2-pro-nf4/codec.pth"
     codes_path = "./output/codes_0.npy"  # 你的 codes 文件路径
     output_path = "reconstructed_from_codes.wav"
     sample_rate = 44100  # 请确保采样率与模型训练时一致

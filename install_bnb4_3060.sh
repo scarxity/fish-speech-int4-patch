@@ -5,7 +5,7 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_NAME="${ENV_NAME:-fish-speech-bnb4}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.12}"
 CUDA_WHL_INDEX="${CUDA_WHL_INDEX:-https://download.pytorch.org/whl/cu128}"
-HF_REPO="${HF_REPO:-groxaxo/s2-pro}"
+HF_REPO="${HF_REPO:-scarxity/fish-speech-s2-pro-nf4}"
 
 is_complete_checkpoint_dir() {
     local dir="$1"
@@ -18,12 +18,12 @@ is_complete_checkpoint_dir() {
 }
 
 if [[ -z "${CHECKPOINT_DIR:-}" ]]; then
-    if is_complete_checkpoint_dir "${REPO_DIR}/checkpoints/s2-pro"; then
-        CHECKPOINT_DIR="${REPO_DIR}/checkpoints/s2-pro"
+    if is_complete_checkpoint_dir "${REPO_DIR}/checkpoints/s2-pro-nf4"; then
+        CHECKPOINT_DIR="${REPO_DIR}/checkpoints/s2-pro-nf4"
     elif is_complete_checkpoint_dir "${REPO_DIR}/checkpoints"; then
         CHECKPOINT_DIR="${REPO_DIR}/checkpoints"
     else
-        CHECKPOINT_DIR="${REPO_DIR}/checkpoints/s2-pro"
+        CHECKPOINT_DIR="${REPO_DIR}/checkpoints/s2-pro-nf4"
     fi
 fi
 

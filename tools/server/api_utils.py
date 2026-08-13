@@ -27,25 +27,25 @@ OPENAI_MODEL_METADATA = (
         "id": "tts-1",
         "object": "model",
         "created": 1710000000,
-        "owned_by": "groxaxo",
+        "owned_by": "scarxity",
     },
     {
         "id": "tts-1-hd",
         "object": "model",
         "created": 1710000000,
-        "owned_by": "groxaxo",
+        "owned_by": "scarxity",
     },
     {
         "id": "fish-speech",
         "object": "model",
         "created": 1710000000,
-        "owned_by": "groxaxo",
+        "owned_by": "scarxity",
     },
     {
         "id": "s2-pro",
         "object": "model",
         "created": 1710000000,
-        "owned_by": "groxaxo",
+        "owned_by": "scarxity",
     },
 )
 
@@ -71,12 +71,12 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument(
         "--llama-checkpoint-path",
         type=str,
-        default="checkpoints/s2-pro",
+        default="checkpoints/s2-pro-nf4",
     )
     parser.add_argument(
         "--decoder-checkpoint-path",
         type=str,
-        default="checkpoints/s2-pro/codec.pth",
+        default="checkpoints/s2-pro-nf4/codec.pth",
     )
     parser.add_argument("--decoder-config-name", type=str, default="modded_dac_vq")
     parser.add_argument("--device", type=str, default="cuda")
@@ -111,6 +111,13 @@ def parse_args(argv: list[str] | None = None):
         type=int,
         default=4096,
         help="Override model max_seq_len for KV-cache pre-allocation (saves VRAM on small GPUs)",
+    )
+    parser.add_argument(
+        "--codec-decode-only",
+        action="store_true",
+        help="Drop the codec encoder and cast the rest to the serving precision "
+        "(~1.36 GiB less VRAM). Requires reference tokens precomputed with "
+        "tools/precompute_references.py, and disables adding references at runtime.",
     )
     parser.add_argument("--listen", type=str, default="0.0.0.0:8880")
     parser.add_argument("--workers", type=int, default=1)

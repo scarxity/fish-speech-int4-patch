@@ -93,6 +93,38 @@ def sample(
     return idx_next, probs
 
 
+# Distillation capture: when a list is installed here, decode_one_token_ar
+# appends (slow_hidden, codebook_indices) per generated frame - the exact
+# tensors the sampler consumed. Only valid in eager mode: a compiled
+# decode_one_token specializes on this being None at trace time.
+_distill_capture_sink: Optional[list] = None
+
+
+def set_distill_capture_sink(sink: Optional[list]) -> None:
+    global _distill_capture_sink
+    _distill_capture_sink = sink
+
+
+def _fast_step(model, student, x, input_pos, *, project: bool):
+    """One position through the depth transformer, teacher or student.
+
+    `project` says whether x is the raw slow hidden (position 0, needs the
+    input projection) or an already-embedded code. The teacher infers this
+    from its own module widths; the student wants it stated, because a student
+    built at in_dim == dim cannot tell the two apart.
+    """
+    if student is None:
+        return model.forward_generate_fast(x, input_pos)
+    return student.forward_generate_fast(x, input_pos, project=project)
+
+
+def _fast_embed(model, student, idx):
+    """Code index -> depth-transformer input width, teacher or student."""
+    if student is None:
+        return model.fast_embeddings(idx)
+    return student.embed(idx)
+
+
 def decode_one_token_ar(
     model: DualARTransformer,
     x: torch.Tensor,
@@ -111,16 +143,21 @@ def decode_one_token_ar(
         audio_masks=audio_masks,
         audio_parts=audio_parts,
     )
-    logits = forward_result.logits  # (1, 1, vocab_size)
+    logits = forward_result.logits  # (1, 1, vocab_size) or (1, 1, semantic_n + 1)
     hidden_states = forward_result.hidden_states
 
-    # Apply constrained decoding: only allow semantic tokens + im_end
-    biased_logits = logits + semantic_logit_bias
+    # A sliced lm_head only emits reachable columns, so the -inf bias is both
+    # unnecessary and the wrong width; sampled indices are mapped back to real
+    # vocabulary ids so everything downstream sees ordinary token ids.
+    sliced_head = getattr(model, "semantic_head", None) is not None
+    biased_logits = logits if sliced_head else logits + semantic_logit_bias
 
     # Normal sample
     main_token_normal = sample(
         biased_logits, temperature=temperature, top_p=top_p, top_k=top_k
     )[0]
+    if sliced_head:
+        main_token_normal = model.semantic_index_to_token_id(main_token_normal)
 
     # RAS: also sample with high temp to use as fallback if token repeats
     high_temp = torch.tensor(
@@ -130,6 +167,8 @@ def decode_one_token_ar(
     main_token_high = sample(
         biased_logits, temperature=high_temp, top_p=high_top_p, top_k=top_k
     )[0]
+    if sliced_head:
+        main_token_high = model.semantic_index_to_token_id(main_token_high)
 
     # Use high-temp sample if: token is semantic AND token is in previous window
     if previous_tokens is not None:
@@ -145,20 +184,27 @@ def decode_one_token_ar(
 
     codebooks = [main_token_normal]
 
+    # A distilled depth transformer, when one is loaded, stands in for the
+    # teacher's fast stack here and nowhere else - same 10-position contract,
+    # same sampling. Resolved once so torch.compile bakes the choice in.
+    student = getattr(model, "fast_student", None)
+
     input_pos = torch.tensor([0], device=hidden_states.device, dtype=torch.long)
-    model.forward_generate_fast(hidden_states, input_pos)
+    _fast_step(model, student, hidden_states, input_pos, project=True)
 
     a = codebooks[0] - model.config.semantic_begin_id
     a = torch.clamp(a, min=0, max=model.config.codebook_size - 1)
 
-    hidden_states = model.fast_embeddings(a)
+    hidden_states = _fast_embed(model, student, a)
     codebooks.append(a)
 
     for codebook_idx in range(1, model.config.num_codebooks):
         input_pos = torch.tensor(
             [codebook_idx], device=hidden_states.device, dtype=torch.long
         )
-        logits = model.forward_generate_fast(hidden_states, input_pos)
+        logits = _fast_step(
+            model, student, hidden_states, input_pos, project=False
+        )
 
         short_logits = logits  # DualAR predicts config.codebook_size number of tokens
 
@@ -170,10 +216,18 @@ def decode_one_token_ar(
             top_k=top_k,
         )[0]
 
-        hidden_states = model.fast_embeddings(a)
+        hidden_states = _fast_embed(model, student, a)
         codebooks.append(a)
 
     codebooks = torch.stack(codebooks, dim=1)
+
+    if _distill_capture_sink is not None:
+        _distill_capture_sink.append(
+            (
+                forward_result.hidden_states.detach().reshape(-1).half().cpu(),
+                codebooks.detach().reshape(-1).to(torch.int16).cpu(),
+            )
+        )
 
     # Only delete references, let Python GC handle cleanup
     del logits, hidden_states, forward_result
@@ -375,6 +429,22 @@ def init_model(
         bnb4_compute_dtype=precision,
     )
 
+    # The embedding table must be held back before any device move, not moved
+    # and then evicted: the OOM this avoids happens during .to(device) itself,
+    # so the table has to never reach the GPU. Detaching it from the module tree
+    # is what keeps .to() from following it.
+    offload_embeddings = os.getenv("FISH_OFFLOAD_EMBEDDINGS", "0") == "1"
+    stashed_embeddings = None
+    if offload_embeddings:
+        if os.getenv("FISH_FULL_LM_HEAD", "0") == "1":
+            raise ValueError(
+                "FISH_OFFLOAD_EMBEDDINGS requires the sliced lm_head; "
+                "unset FISH_FULL_LM_HEAD"
+            )
+        model.build_semantic_head(model.tokenizer.get_token_id(IM_END_TOKEN))
+        stashed_embeddings = model.embeddings
+        model.embeddings = None
+
     if bnb4:
         if getattr(model, "_bnb4_prequantized", False):
             try:
@@ -414,11 +484,54 @@ def init_model(
             model = model.to(device=device)
     else:
         model = model.to(device=device, dtype=precision)
+    if offload_embeddings:
+        # Reattach on the host, in the serving precision. Detaching the table
+        # above also hid it from the dtype cast that follows the device move, so
+        # without this it stays fp32 and every activation derived from it does
+        # too - which then mismatches the fp16 semantic_head at the lm_head.
+        model.embeddings = stashed_embeddings.to(dtype=precision)
+        model.embeddings_offloaded = True
+        logger.info(f"Embedding table held in host memory ({precision})")
+
     model._bandwidth_model_size = sum(
         p.numel() for p in model.parameters() if p.requires_grad
     )
     model._debug_prompt_structure = os.getenv("FISH_SPEECH_DEBUG_PROMPT", "0") == "1"
     logger.info(f"Restored model from checkpoint")
+
+    if not offload_embeddings and os.getenv("FISH_FULL_LM_HEAD", "0") != "1":
+        model.build_semantic_head(model.tokenizer.get_token_id(IM_END_TOKEN))
+
+    # Swap in a distilled depth transformer if one is configured. Unset, this
+    # is inert and the teacher's fast stack serves as before, so the student is
+    # opt-in and reversible by dropping the variable.
+    student_path = os.getenv("FISH_FAST_STUDENT", "").strip()
+    if student_path:
+        from fish_speech.models.text2semantic.fast_student import FastStudent
+
+        student = FastStudent.load(student_path, device=device, dtype=precision)
+        if student.config.num_codebooks != model.config.num_codebooks:
+            raise ValueError(
+                f"student was trained for {student.config.num_codebooks} codebooks, "
+                f"checkpoint has {model.config.num_codebooks}"
+            )
+        if student.config.in_dim != model.config.dim:
+            raise ValueError(
+                f"student expects a {student.config.in_dim}-wide slow hidden, "
+                f"checkpoint emits {model.config.dim}"
+            )
+        model.fast_student = student
+        # Free the teacher's depth stack only once the student is in place, so a
+        # failed load leaves a working model. Without this the student is loaded
+        # *alongside* what it replaces and costs memory instead of saving it.
+        model.release_fast_stack()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        logger.info(
+            f"Depth transformer: distilled student from {student_path} "
+            f"({student.num_parameters / 1e6:.1f}M params, dim {student.config.dim}); "
+            "teacher depth stack released"
+        )
 
     if isinstance(model, DualARTransformer):
         decode_one_token = decode_one_token_ar
@@ -575,6 +688,56 @@ def group_turns_into_batches(
     return batches
 
 
+def split_plain_text_into_batches(text: str, max_bytes: int = 300) -> list[str]:
+    """Split text with no speaker tags into batches at sentence boundaries.
+
+    Speaker-tagged text is batched by group_turns_into_batches; plain text used
+    to bypass batching entirely and be generated in one pass. That makes one
+    decode as long as the whole utterance, and codec decode activations scale
+    with length, so long inputs exhaust a small GPU.
+
+    Batches are joined back with the same separator the tagged path uses, and
+    each one is generated with the previously generated codes in context, so
+    prosody carries across the boundary.
+    """
+    # Keep the delimiter attached to the sentence it ends. Paragraph breaks are
+    # split points too, since they are natural pauses.
+    pieces = [
+        p.strip()
+        for p in re.split(r"(?<=[.!?;:。！？；：\n])\s+", text.strip())
+        if p.strip()
+    ]
+
+    batches: list[str] = []
+    current: list[str] = []
+    current_bytes = 0
+
+    for piece in pieces:
+        piece_bytes = len(piece.encode("utf-8"))
+
+        # A single sentence over the limit still has to go somewhere; emit it
+        # alone rather than splitting mid-sentence, which would cut prosody.
+        if piece_bytes > max_bytes:
+            if current:
+                batches.append("\n".join(current))
+                current, current_bytes = [], 0
+            batches.append(piece)
+            continue
+
+        # +1 for the "\n" that will join this piece to the current batch.
+        if current and current_bytes + piece_bytes + 1 > max_bytes:
+            batches.append("\n".join(current))
+            current, current_bytes = [piece], piece_bytes
+        else:
+            current.append(piece)
+            current_bytes += piece_bytes
+
+    if current:
+        batches.append("\n".join(current))
+
+    return batches or [text]
+
+
 def generate_long(
     *,
     model,
@@ -662,6 +825,8 @@ def generate_long(
         batches = group_turns_into_batches(
             turns, max_speakers=5, max_bytes=chunk_length
         )
+    elif iterative_prompt and chunk_length > 0:
+        batches = split_plain_text_into_batches(text, max_bytes=chunk_length)
     else:
         batches = [text]
 
@@ -727,9 +892,17 @@ def generate_long(
                     f"Audio masks non-zero count: {torch.count_nonzero(audio_masks)}"
                 )
 
-            if encoded.size(1) > max_length - 2048:
+            # Reserve room for what this request may actually generate rather
+            # than a hardcoded 2048. The constant assumed a large context: with
+            # max_seq_len tuned down to fit a small GPU it made the usable
+            # prompt length zero, or negative.
+            # max_new_tokens=0 means "generate into whatever context remains",
+            # so fall back to reserving half the window rather than nothing.
+            prompt_budget = max_length - (max_new_tokens or max_length // 2)
+            if encoded.size(1) > prompt_budget:
                 raise ValueError(
-                    f"Prompt is too long: {encoded.size(1)} > {max_length - 2048}"
+                    f"Prompt is too long: {encoded.size(1)} > {prompt_budget} "
+                    f"(max_seq_len {max_length} - max_new_tokens {max_new_tokens})"
                 )
 
             encoded = encoded.to(device=device)
@@ -815,22 +988,33 @@ def launch_thread_safe_queue(
 ):
     input_queue = queue.Queue()
     init_event = threading.Event()
+    init_error: list[BaseException] = []
 
     def worker():
-        model, decode_one_token = init_model(
-            checkpoint_path,
-            device,
-            precision,
-            compile=compile,
-            max_length=max_seq_len,
-            bnb4=bnb4,
-        )
-        with torch.device(device):
-            model.setup_caches(
-                max_batch_size=1,
-                max_seq_len=model.config.max_seq_len,
-                dtype=next(model.parameters()).dtype,
+        # Model load runs outside the per-request try/except below. If it raises
+        # (OOM on a small GPU is the common case) the thread dies, and without
+        # recording it here init_event would never fire and the caller would
+        # block on init_event.wait() forever instead of surfacing the failure.
+        try:
+            model, decode_one_token = init_model(
+                checkpoint_path,
+                device,
+                precision,
+                compile=compile,
+                max_length=max_seq_len,
+                bnb4=bnb4,
             )
+            with torch.device(device):
+                model.setup_caches(
+                    max_batch_size=1,
+                    max_seq_len=model.config.max_seq_len,
+                    dtype=next(model.parameters()).dtype,
+                )
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the caller
+            logger.error(f"Model initialisation failed: {traceback.format_exc()}")
+            init_error.append(exc)
+            init_event.set()
+            return
         init_event.set()
 
         while True:
@@ -862,6 +1046,8 @@ def launch_thread_safe_queue(
 
     threading.Thread(target=worker, daemon=True).start()
     init_event.wait()
+    if init_error:
+        raise RuntimeError("Model initialisation failed") from init_error[0]
 
     return input_queue
 
@@ -894,7 +1080,7 @@ def launch_thread_safe_queue(
 @click.option(
     "--checkpoint-path",
     type=click.Path(path_type=Path, exists=True),
-    default="checkpoints/s2-pro",
+    default="checkpoints/s2-pro-nf4",
 )
 @click.option("--device", type=str, default="cuda")
 @click.option("--compile/--no-compile", default=False)
@@ -904,7 +1090,7 @@ def launch_thread_safe_queue(
     "--max-seq-len",
     "max_length",
     type=int,
-    default=None,
+    default=4096,
     help="Override model max_seq_len for KV-cache pre-allocation.",
 )
 @click.option(

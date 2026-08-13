@@ -408,6 +408,83 @@ class BaseTransformer(nn.Module):
                 dtype=dtype,
             )
 
+    def build_semantic_head(self, im_end_id: int) -> None:
+        """Cache the only output rows generation can ever select.
+
+        Decoding is constrained to the semantic block plus im_end, so the tied
+        lm_head only needs those rows. Slicing it turns a 155776-row projection
+        into a 4097-row one, which is ~0.72 GiB less weight traffic per frame.
+        Index i < semantic_n maps back to semantic_begin_id + i; the final index
+        is im_end.
+        """
+        b, e = self.config.semantic_begin_id, self.config.semantic_end_id
+        if not (0 <= b <= e < self.config.vocab_size):
+            logger.warning(
+                f"Semantic range {b}-{e} invalid for vocab {self.config.vocab_size}; "
+                "keeping the full lm_head."
+            )
+            return
+
+        if self.config.tie_word_embeddings:
+            w = self.embeddings.weight
+        else:
+            w = self.output.weight
+        self.register_buffer(
+            "semantic_head",
+            torch.cat([w[b : e + 1], w[im_end_id : im_end_id + 1]], dim=0).clone(),
+            persistent=False,
+        )
+        self.semantic_n = e - b + 1
+        self.im_end_id = im_end_id
+        logger.info(
+            f"Sliced lm_head to {self.semantic_head.shape[0]} reachable rows "
+            f"(from {self.config.vocab_size})"
+        )
+
+    def offload_embeddings(self) -> None:
+        """Keep the full embedding table in host memory.
+
+        Only prefill embeds arbitrary vocabulary (the prompt text); every token
+        generated afterwards is semantic or im_end, and semantic_head already
+        holds those rows on the GPU. Moving the 155776x2560 fp16 table to the
+        host therefore frees ~0.72 GiB of VRAM without adding any per-frame
+        host traffic - the prefill gather costs one ~5 MB transfer per request.
+        """
+        if getattr(self, "semantic_head", None) is None:
+            logger.warning("Cannot offload embeddings without a semantic_head")
+            return
+        self.embeddings = self.embeddings.to("cpu")
+        self.embeddings_offloaded = True
+        logger.info("Moved embedding table to host memory")
+
+    def embed_main_tokens(self, tok: Tensor) -> Tensor:
+        """Embed the main-codebook token, using the GPU slice where possible."""
+        if not getattr(self, "embeddings_offloaded", False):
+            return self.embeddings(tok)
+
+        if tok.shape[-1] == 1:
+            # Decode step: guaranteed semantic or im_end, so the resident slice
+            # covers it. Index i < semantic_n is semantic_begin_id + i.
+            idx = torch.where(
+                tok == self.im_end_id,
+                torch.full_like(tok, self.semantic_n),
+                tok - self.config.semantic_begin_id,
+            ).clamp_(0, self.semantic_n)
+            return F.embedding(idx, self.semantic_head)
+
+        # Prefill: arbitrary vocabulary, so gather on the host and ship the
+        # result across once.
+        out = self.embeddings(tok.to("cpu"))
+        return out.to(self.semantic_head.device, non_blocking=True)
+
+    def semantic_index_to_token_id(self, idx: Tensor) -> Tensor:
+        """Map an index into semantic_head back to a real vocabulary id."""
+        return torch.where(
+            idx < self.semantic_n,
+            idx + self.config.semantic_begin_id,
+            torch.full_like(idx, self.im_end_id),
+        )
+
     def embed(self, inp: Tensor) -> Tensor:
         embeds = []
 
@@ -496,7 +573,7 @@ class BaseTransformer(nn.Module):
         )
 
         vq_embeds_sum[~vq_masks] = 0
-        x = self.embeddings(inp[:, 0]) + vq_embeds_sum
+        x = self.embed_main_tokens(inp[:, 0]) + vq_embeds_sum
 
         if self.config.scale_codebook_embeddings:
             vq_masks_expanded = vq_masks.unsqueeze(-1).expand_as(x)
@@ -536,6 +613,13 @@ class BaseTransformer(nn.Module):
 
         if self.config.is_reward_model:
             token_logits = self.score_output(slow_out)
+        elif getattr(self, "semantic_head", None) is not None:
+            # Generation can only ever emit a semantic token or im_end (see the
+            # -inf logit bias in inference.generate_long), so projecting onto the
+            # full vocab computes ~155k logits per frame and discards all but
+            # 4097 of them. Project onto just the reachable rows instead; callers
+            # map the resulting index back to a real token id.
+            token_logits = F.linear(slow_out, self.semantic_head)
         elif self.config.tie_word_embeddings:
             token_logits = F.linear(slow_out, self.embeddings.weight)
         else:
@@ -848,6 +932,23 @@ class DualARTransformer(BaseTransformer):
         )
         self.apply(self._init_weights)
 
+    def release_fast_stack(self) -> None:
+        """Drop the teacher's depth transformer once a student stands in for it.
+
+        Serving with a student never touches fast_layers/fast_embeddings/
+        fast_norm/fast_output again, but they stay resident otherwise - which
+        would make a distilled student a net memory *cost* rather than a saving,
+        since it is loaded alongside rather than in place of them.
+
+        fast_project_in stays: forward_generate applies it to every hidden state
+        on the main generate path, not only inside the depth loop. It is
+        nn.Identity whenever fast_dim == dim, so it costs nothing to keep.
+        """
+        self.fast_layers = nn.ModuleList()
+        self.fast_embeddings = None
+        self.fast_norm = None
+        self.fast_output = None
+
     def setup_caches(
         self, max_batch_size: int, max_seq_len: int, dtype: torch.dtype = torch.bfloat16
     ):
@@ -863,6 +964,11 @@ class DualARTransformer(BaseTransformer):
                 self.config.fast_head_dim,
                 dtype=dtype,
             )
+
+        # A distilled stand-in needs its own caches, sized the same way.
+        student = getattr(self, "fast_student", None)
+        if student is not None:
+            student.setup_caches(max_batch_size, dtype=dtype)
 
     def forward(
         self,

@@ -2,6 +2,7 @@ import os
 import re
 import tempfile
 import time
+from datetime import datetime
 from http import HTTPStatus
 from pathlib import Path
 
@@ -57,6 +58,18 @@ from tools.server.model_utils import (
 )
 routes = Routes()
 
+RTF_LOG_PATH = Path("logs/rtf.log")
+
+
+def _log_rtf(endpoint: str, elapsed: float, audio_duration: float) -> None:
+    rtf = elapsed / audio_duration if audio_duration > 0 else float("inf")
+    RTF_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(RTF_LOG_PATH, "a") as f:
+        f.write(
+            f"{datetime.now().isoformat()} endpoint={endpoint} "
+            f"elapsed={elapsed:.3f}s audio_duration={audio_duration:.3f}s rtf={rtf:.3f}\n"
+        )
+
 
 def _mark_request_activity():
     request.app.state.last_request_time = time.time()
@@ -82,6 +95,26 @@ async def _tracked_stream(iterable):
             _mark_request_activity()
             yield chunk
     finally:
+        _end_request_work()
+
+
+async def _tracked_stream_with_rtf(iterable, endpoint: str, sample_rate: int):
+    """Like _tracked_stream, but also logs RTF once the stream finishes.
+
+    Streaming responses are int16 mono PCM chunks, so audio duration is
+    derived from total bytes yielded rather than a known-upfront duration.
+    """
+    start = time.time()
+    total_bytes = 0
+    try:
+        async for chunk in iterable:
+            _mark_request_activity()
+            if isinstance(chunk, bytes):
+                total_bytes += len(chunk)
+            yield chunk
+    finally:
+        audio_duration = total_bytes / (2 * sample_rate) if sample_rate else 0
+        _log_rtf(endpoint, time.time() - start, audio_duration)
         _end_request_work()
 
 
@@ -206,14 +239,20 @@ async def tts(req: Annotated[ServeTTSRequest, Body(exclusive=True)]):
 
         if req.streaming:
             return StreamResponse(
-                iterable=_tracked_stream(inference_async(req, engine)),
+                iterable=_tracked_stream_with_rtf(
+                    inference_async(req, engine), "/v1/tts", sample_rate
+                ),
                 headers=_audio_headers(
                     req.format, chunked=True, language=req.language, seed=req.seed
                 ),
                 content_type=get_content_type(req.format),
             )
 
+        gen_start = time.time()
         fake_audios = next(inference(req, engine))
+        _log_rtf(
+            "/v1/tts", time.time() - gen_start, len(fake_audios) / sample_rate
+        )
         audio_bytes = serialize_audio_output(fake_audios, sample_rate, req.format)
         return StreamResponse(
             iterable=_tracked_stream(buffer_to_async_generator(audio_bytes)),
@@ -282,7 +321,11 @@ async def openai_speech(req: Annotated[OpenAISpeechRequest, Body(exclusive=True)
 
         if req.stream and tts_req.streaming:
             return StreamResponse(
-                iterable=_tracked_stream(inference_async(tts_req, engine)),
+                iterable=_tracked_stream_with_rtf(
+                    inference_async(tts_req, engine),
+                    "/v1/audio/speech",
+                    sample_rate,
+                ),
                 headers=_audio_headers(
                     tts_req.format,
                     chunked=True,
@@ -292,7 +335,11 @@ async def openai_speech(req: Annotated[OpenAISpeechRequest, Body(exclusive=True)
                 content_type=get_content_type(tts_req.format),
             )
 
+        gen_start = time.time()
         fake_audios = next(inference(tts_req, engine))
+        _log_rtf(
+            "/v1/audio/speech", time.time() - gen_start, len(fake_audios) / sample_rate
+        )
         audio_bytes = serialize_audio_output(fake_audios, sample_rate, tts_req.format)
 
         if req.stream:

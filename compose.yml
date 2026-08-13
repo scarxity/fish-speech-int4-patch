@@ -20,7 +20,78 @@ services:
     build:
       target: server
     environment:
-      COMPILE: ${COMPILE:-0}
+      # torch.compile the decode step: much faster per token; the one-time
+      # compile cost is paid during the eager warm-up at container start.
+      COMPILE: ${COMPILE:-1}
+      # Load the model at startup instead of on first request: the hermes TTS
+      # script times out at 60s, far less than the ~3 min lazy first load.
+      ENABLE_LAZY_LOAD: ${ENABLE_LAZY_LOAD:-0}
     profiles: ["server"]
     ports:
       - "${API_PORT:-8880}:8880"
+
+  # Same server, tuned for a 4 GB card (RTX 3050 Laptop). Measured at 3294 MiB
+  # peak on the standard suite and 3462 MiB on a 44 s utterance, both on a
+  # 4096 MiB budget, sub-realtime throughout.
+  #
+  # Reference tokens must exist before starting, because the codec is loaded
+  # without its encoder:
+  #   docker compose run --rm --entrypoint uv server-4gb \
+  #     run --no-sync python tools/precompute_references.py
+  server-4gb:
+    extends:
+      file: compose.base.yml
+      service: app-base
+    build:
+      target: server
+    environment:
+      COMPILE: ${COMPILE:-1}
+      ENABLE_LAZY_LOAD: ${ENABLE_LAZY_LOAD:-0}
+      # Keep the 155776x2560 fp16 embedding table in host memory; decode reads
+      # the resident 4097-row slice instead. ~0.72 GiB.
+      FISH_OFFLOAD_EMBEDDINGS: "1"
+      # Drop the codec encoder and cast the decode path to fp16. ~1.36 GiB.
+      CODEC_DECODE_ONLY: "1"
+      # Both the KV cache and the torch.compile workspace scale with this, so
+      # raising it to widen the prompt budget costs more memory than it buys.
+      # Lower max_new_tokens per request instead - the budget is
+      # max_seq_len - max_new_tokens.
+      MAX_SEQ_LEN: ${MAX_SEQ_LEN:-2048}
+      # Decode the codec conv stack in 64-frame (~3 s) chunks so activations
+      # stop scaling with utterance length. Bit-exact beyond the conv
+      # receptive field (overlap 32 vs measured minimum 10); costs ~15% wall
+      # on long utterances, buys ~250 MiB of peak headroom.
+      FISH_DECODE_CHUNK_FRAMES: ${FISH_DECODE_CHUNK_FRAMES:-64}
+      # Path to a distilled depth transformer, e.g.
+      # checkpoints/fast-student-d1024.pt. Empty (the default) serves the
+      # teacher's own fast stack. Set it in .env - pointing at a file that is
+      # not there fails the load, so this cannot default to a path.
+      FISH_FAST_STUDENT: ${FISH_FAST_STUDENT:-}
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    profiles: ["server-4gb"]
+    ports:
+      - "${API_PORT:-8880}:8880"
+
+  # WebUI with the same 4 GB tuning as server-4gb. Run one or the other, never
+  # both: each loads its own copy of the model.
+  #
+  # The codec has no encoder here, so uploading new reference audio through the
+  # UI will not work - only voices already under references/ with precomputed
+  # tokens are selectable.
+  webui-4gb:
+    extends:
+      file: compose.base.yml
+      service: app-base
+    build:
+      target: webui
+    environment:
+      COMPILE: ${COMPILE:-1}
+      FISH_OFFLOAD_EMBEDDINGS: "1"
+      CODEC_DECODE_ONLY: "1"
+      MAX_SEQ_LEN: ${MAX_SEQ_LEN:-2048}
+      FISH_DECODE_CHUNK_FRAMES: ${FISH_DECODE_CHUNK_FRAMES:-64}
+      FISH_FAST_STUDENT: ${FISH_FAST_STUDENT:-}
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    profiles: ["webui-4gb"]
+    ports:
+      - "${GRADIO_PORT:-7860}:7860"

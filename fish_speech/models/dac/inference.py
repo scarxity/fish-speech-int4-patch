@@ -11,6 +11,8 @@ from hydra import compose, initialize
 from hydra.utils import instantiate
 from loguru import logger
 from omegaconf import OmegaConf
+from torch.nn.utils import remove_weight_norm
+from torch.nn.utils.parametrize import is_parametrized, remove_parametrizations
 
 pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
@@ -20,14 +22,56 @@ from fish_speech.utils.file import AUDIO_EXTENSIONS
 OmegaConf.register_new_resolver("eval", eval)
 
 
-def load_model(config_name, checkpoint_path, device="cuda"):
+def _fold_weight_norms(model: torch.nn.Module) -> int:
+    """Bake weight-norm reparametrizations into plain weights.
+
+    weight_norm keeps (g, v) and recomputes w = g * v / ||v|| on every forward,
+    materialising a full-size weight temporary each call - training machinery
+    with no inference value. Folding runs that same computation once on the
+    same values, so the result is bitwise identical. Handles both the legacy
+    hook API (dac's WNConv1d) and the parametrization API (CausalConvNet).
+    """
+    folded = 0
+    for module in model.modules():
+        if is_parametrized(module, "weight"):
+            remove_parametrizations(module, "weight", leave_parametrized=True)
+            folded += 1
+        elif hasattr(module, "weight_g") and hasattr(module, "weight_v"):
+            remove_weight_norm(module)
+            folded += 1
+    return folded
+
+
+def load_model(
+    config_name,
+    checkpoint_path,
+    device="cuda",
+    decode_only: bool = False,
+    precision: torch.dtype | None = None,
+    fold_weight_norm: bool = True,
+):
+    """Load the DAC codec.
+
+    decode_only drops the analysis half of the codec. Serving only ever calls
+    from_indices(), i.e. quantizer.decode() -> decoder, which touches neither
+    the encoder nor quantizer.pre_module/downsample. Those account for ~0.96 GiB
+    of resident weights, including a 16384x16384 bool causal_mask buffer. They
+    are still needed to turn reference audio into VQ codes, so a decode-only
+    server requires reference tokens to have been precomputed
+    (tools/precompute_references.py).
+
+    precision casts the remaining floating-point weights. Decoding already runs
+    under autocast at this dtype, so fp32 weights buy no accuracy - but casting
+    is only safe alongside decode_only, because the encode path runs outside
+    autocast and would raise on a dtype mismatch.
+    """
     hydra.core.global_hydra.GlobalHydra.instance().clear()
     with initialize(version_base="1.3", config_path="../../configs"):
         cfg = compose(config_name=config_name)
 
     model = instantiate(cfg)
     state_dict = torch.load(
-        checkpoint_path, map_location=device, mmap=True, weights_only=True
+        checkpoint_path, map_location="cpu", mmap=True, weights_only=True
     )
     if "state_dict" in state_dict:
         state_dict = state_dict["state_dict"]
@@ -39,11 +83,42 @@ def load_model(config_name, checkpoint_path, device="cuda"):
             if "generator." in k
         }
 
+    if decode_only:
+        drop = ("encoder.", "quantizer.pre_module.", "quantizer.downsample.")
+        state_dict = {
+            k: v for k, v in state_dict.items() if not k.startswith(drop)
+        }
+
     result = model.load_state_dict(state_dict, strict=False, assign=True)
+
+    if decode_only:
+        # Delete before .to(device) so these never occupy VRAM at all.
+        model.encoder = None
+        model.quantizer.pre_module = None
+        model.quantizer.downsample = None
+        model.decode_only = True
+
     model.eval()
+
+    if fold_weight_norm:
+        # Before the precision cast, so w = g * v / ||v|| is computed in fp32.
+        folded = _fold_weight_norms(model)
+        logger.info(f"Folded weight norm on {folded} modules")
+
+    if precision is not None:
+        if not decode_only:
+            raise ValueError(
+                "precision casting requires decode_only=True: the encode path "
+                "runs outside autocast and would fail on a dtype mismatch"
+            )
+        model.to(dtype=precision)
+
     model.to(device)
 
-    logger.info(f"Loaded model: {result}")
+    logger.info(
+        f"Loaded model: {result}"
+        + (f" (decode_only, {precision})" if decode_only else "")
+    )
     return model
 
 

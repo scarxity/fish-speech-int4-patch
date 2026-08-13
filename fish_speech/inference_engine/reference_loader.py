@@ -43,6 +43,41 @@ class ReferenceLoader:
         else:
             self.backend = "soundfile"
 
+    @staticmethod
+    def cached_tokens_path(ref_audio) -> Path:
+        """Where precomputed VQ codes for a reference clip live."""
+        ref_audio = Path(ref_audio)
+        if ref_audio == DEFAULT_REFERENCE_AUDIO_PATH:
+            # The bundled clip sits at the repository root, which inside a
+            # container is an image layer: writable but discarded on exit, and
+            # read-only in some deployments. Keep its cache alongside the other
+            # references, which is the mounted, persistent location.
+            return Path("references") / DEFAULT_REFERENCE_ID / "sample.tokens.pt"
+        return ref_audio.with_suffix(".tokens.pt")
+
+    def load_or_encode_reference(self, ref_audio):
+        """Return VQ codes for a reference clip, preferring the on-disk cache.
+
+        A decode-only codec has no encoder, so it can only serve references
+        whose codes were precomputed by tools/precompute_references.py.
+        """
+        cache = self.cached_tokens_path(ref_audio)
+        if cache.exists():
+            codes = torch.load(cache, map_location="cpu", weights_only=True)
+            logger.info(f"Loaded cached reference tokens: {cache} {tuple(codes.shape)}")
+            return codes.to(self.decoder_model.device)
+
+        if getattr(self.decoder_model, "decode_only", False):
+            raise RuntimeError(
+                f"No cached tokens at {cache} and the codec was loaded decode-only "
+                "(no encoder). Run: python tools/precompute_references.py"
+            )
+
+        return self.encode_reference(
+            reference_audio=audio_to_bytes(str(ref_audio)),
+            enable_reference_audio=True,
+        )
+
     def load_by_id(
         self,
         id: str,
@@ -66,12 +101,7 @@ class ReferenceLoader:
         if use_cache == "off" or id not in self.ref_by_id:
             # If the references are not already loaded, encode them
             prompt_tokens = [
-                self.encode_reference(
-                    # decoder_model=self.decoder_model,
-                    reference_audio=audio_to_bytes(str(ref_audio)),
-                    enable_reference_audio=True,
-                )
-                for ref_audio in ref_audios
+                self.load_or_encode_reference(ref_audio) for ref_audio in ref_audios
             ]
             prompt_texts = [read_ref_text(str(ref_text)) for ref_text in ref_texts]
             self.ref_by_id[id] = (prompt_tokens, prompt_texts)
